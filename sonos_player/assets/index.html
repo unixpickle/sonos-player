@@ -1,0 +1,267 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Record Audio</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 20px; }
+    button { margin-right: 10px; padding: 8px 12px; }
+    #status { margin-top: 10px; white-space: pre-wrap; }
+    .volume { margin: 15px 0; }
+    .volume label { margin-right: 10px; }
+    code { background: #f4f4f4; padding: 2px 4px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Record</h1>
+
+  <div class="volume">
+    <label for="volume">Volume:</label>
+    <input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" />
+    <span id="volumeValue">0.80</span>
+  </div>
+
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+
+  <div style="margin-top: 12px;">
+    <div>Preview (original recording):</div>
+    <audio id="previewOriginal" controls></audio>
+  </div>
+
+  <div style="margin-top: 12px;">
+    <div>Preview (WAV sent to Sonos):</div>
+    <audio id="previewWav" controls></audio>
+  </div>
+
+  <div id="status"></div>
+
+<script>
+const startBtn = document.getElementById("start");
+const stopBtn  = document.getElementById("stop");
+const statusEl = document.getElementById("status");
+
+const previewOriginal = document.getElementById("previewOriginal");
+const previewWav      = document.getElementById("previewWav");
+
+const volumeInput = document.getElementById("volume");
+const volumeValue = document.getElementById("volumeValue");
+
+volumeInput.oninput = () => {
+  volumeValue.textContent = Number(volumeInput.value).toFixed(2);
+};
+
+let mediaRecorder;
+let chunks = [];
+let stream;
+
+// ---------- WAV encoding helpers (PCM s16le) ----------
+function writeString(view, offset, str) {
+  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+}
+
+function floatTo16BitPCM(view, offset, input) {
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, input[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+}
+
+function interleave(ch0, ch1) {
+  const len = Math.min(ch0.length, ch1.length);
+  const out = new Float32Array(len * 2);
+  for (let i = 0; i < len; i++) {
+    out[i * 2]     = ch0[i];
+    out[i * 2 + 1] = ch1[i];
+  }
+  return out;
+}
+
+function encodeWAVFromFloat32Stereo(stereoInterleaved, sampleRate) {
+  const numChannels = 2;
+  const bitsPerSample = 16;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = stereoInterleaved.length * (bitsPerSample / 8);
+
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, "WAVE");
+
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);      // PCM fmt chunk size
+  view.setUint16(20, 1, true);       // format = 1 (PCM)
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+
+  writeString(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  floatTo16BitPCM(view, 44, stereoInterleaved);
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+// Decode -> resample to 44.1k -> force stereo -> PCM16 WAV
+async function blobToSonosWav(blob) {
+  const inputBuf = await blob.arrayBuffer();
+
+  // Use an AudioContext only for decoding
+  const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await decodeCtx.decodeAudioData(inputBuf.slice(0));
+  await decodeCtx.close?.().catch(() => {});
+
+  // Force target format: 44.1kHz stereo
+  const targetRate = 44100;
+  const targetChannels = 2;
+
+  // OfflineAudioContext does resampling for us when sampleRate differs.
+  const lengthAtTarget = Math.ceil(decoded.duration * targetRate);
+  const offline = new OfflineAudioContext(targetChannels, lengthAtTarget, targetRate);
+
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+
+  // Optional: ensure amplitude doesn't clip; you can add gain node here if desired.
+  src.connect(offline.destination);
+  src.start(0);
+
+  const rendered = await offline.startRendering();
+
+  // Force stereo: if rendered somehow returns mono, duplicate it
+  const ch0 = rendered.getChannelData(0);
+  const ch1 = (rendered.numberOfChannels > 1) ? rendered.getChannelData(1) : ch0;
+
+  const stereo = interleave(ch0, ch1);
+  return encodeWAVFromFloat32Stereo(stereo, targetRate);
+}
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+function disableUI(recording) {
+  startBtn.disabled = recording;
+  stopBtn.disabled = !recording;
+}
+
+// Pick the best mimeType available for MediaRecorder.
+function pickRecorderMimeType() {
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/ogg"
+  ];
+  for (const t of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported?.(t)) return t;
+  }
+  return ""; // let browser choose
+}
+
+async function safeGetUserMedia() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("getUserMedia not available (requires https:// or localhost, and a supported browser).");
+  }
+  return await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true
+    }
+  });
+}
+
+startBtn.onclick = async () => {
+  try {
+    setStatus("Requesting microphone…");
+    disableUI(true);
+
+    stream = await safeGetUserMedia();
+    chunks = [];
+
+    const mimeType = pickRecorderMimeType();
+    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
+    mediaRecorder.ondataavailable = e => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+
+    mediaRecorder.onerror = (e) => {
+      console.error(e);
+      setStatus("Recorder error: " + (e.error?.message || e.message || String(e)));
+    };
+
+    mediaRecorder.onstop = async () => {
+      try {
+        const recordedBlob = new Blob(chunks, { type: mediaRecorder.mimeType || "application/octet-stream" });
+        previewOriginal.src = URL.createObjectURL(recordedBlob);
+
+        setStatus("Converting to Sonos WAV (PCM16 44.1k stereo)…");
+        const wavBlob = await blobToSonosWav(recordedBlob);
+        previewWav.src = URL.createObjectURL(wavBlob);
+
+        const volume = Math.min(1, Math.max(0, Number(volumeInput.value)));
+
+        setStatus(
+          `Uploading WAV (${Math.round(wavBlob.size / 1024)} KB)\n` +
+          `Format: PCM16, 44.1kHz, stereo\n` +
+          `Volume: ${volume.toFixed(2)}…`
+        );
+
+        const resp = await fetch(`/play_bytes?volume=${encodeURIComponent(volume)}`, {
+          method: "POST",
+          headers: { "Content-Type": "audio/wav" },
+          body: await wavBlob.arrayBuffer(),
+        });
+
+        // If your server returns JSON sometimes, parse it, but don't require it.
+        const text = await resp.text();
+        let json = {};
+        try { json = text ? JSON.parse(text) : {}; } catch {}
+
+        if (resp.ok) {
+          setStatus("Uploaded & played ✅");
+        } else {
+          setStatus("Upload failed: " + (json.error || text || resp.status));
+        }
+      } catch (err) {
+        console.error(err);
+        setStatus("Stop handler error: " + (err?.message || String(err)));
+      } finally {
+        // Ensure tracks stopped and UI reset
+        stream?.getTracks?.().forEach(t => t.stop());
+        disableUI(false);
+      }
+    };
+
+    mediaRecorder.start(250); // timeslice gives more consistent dataavailable events
+    setStatus("Recording…");
+  } catch (err) {
+    console.error(err);
+    setStatus("Start failed: " + (err?.message || String(err)));
+    stream?.getTracks?.().forEach(t => t.stop());
+    disableUI(false);
+  }
+};
+
+stopBtn.onclick = () => {
+  try {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      setStatus("Stopping…");
+      mediaRecorder.stop();
+    } else {
+      disableUI(false);
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus("Stop failed: " + (err?.message || String(err)));
+    disableUI(false);
+  }
+};
+</script>
+</body>
+</html>
